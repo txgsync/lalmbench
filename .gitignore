@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+env/
+venv/
+
+# Benchmark logs
+logs/
+lalm_benchmark_run_*.json
+
+# Personal shitpost (not for public repo)
+SHITPOST.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
