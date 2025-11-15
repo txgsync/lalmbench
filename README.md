@@ -37,7 +37,8 @@ python lalm_context_benchmark.py --num-rounds 1
 python lalm_context_benchmark.py \
   --num-rounds 10 \
   --model gpt-oss-120b \
-  --base-url http://localhost:1234/v1
+  --base-url http://localhost:1234/v1 \
+  --verbose  # Include full conversation in output
 ```
 
 ## Output
@@ -46,6 +47,7 @@ Results saved to `logs/lalm_benchmark_run_[timestamp].json` with:
 - Per-turn metrics (TTFT, tokens/sec, token counts)
 - Summary statistics (averages, totals)
 - Running stats displayed after each turn
+- Full conversation (with `--verbose` flag) for quality analysis
 
 ## Methodology
 

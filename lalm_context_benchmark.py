@@ -110,8 +110,13 @@ class BenchmarkMetrics:
             }
         }
 
-    def save_to_json(self, filepath: Optional[Path] = None):
-        """Save complete metrics to JSON file"""
+    def save_to_json(self, filepath: Optional[Path] = None, conversation: Optional[List[Dict]] = None):
+        """Save complete metrics to JSON file
+
+        Args:
+            filepath: Optional path to save to
+            conversation: Optional full conversation history (for verbose mode)
+        """
         if filepath is None:
             # Create logs directory if it doesn't exist
             logs_dir = Path("logs")
@@ -122,6 +127,10 @@ class BenchmarkMetrics:
             "summary": self.get_summary(),
             "turns": [asdict(m) for m in self.turn_metrics]
         }
+
+        # Add full conversation if verbose mode enabled
+        if conversation is not None:
+            data["conversation"] = conversation
 
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
@@ -158,12 +167,13 @@ def extract_reasoning_content(text: str, encoding) -> Tuple[str, int, int]:
 class LALMBenchmark:
     """Main benchmark orchestrator"""
 
-    def __init__(self, base_url: str = "http://localhost:1234/v1", model: Optional[str] = None):
+    def __init__(self, base_url: str = "http://localhost:1234/v1", model: Optional[str] = None, verbose: bool = False):
         self.client = OpenAI(base_url=base_url, api_key="lm-studio")
         self.model = model
         self.messages: List[Dict[str, str]] = []
         self.metrics = BenchmarkMetrics()
         self.conversation_total_tokens = 0
+        self.verbose = verbose
 
         # Initialize tiktoken encoding for accurate token counting
         # Use cl100k_base which is used by GPT-4 and GPT-3.5-turbo
@@ -391,8 +401,14 @@ class LALMBenchmark:
         finally:
             # Print summary and save
             self.print_summary()
-            log_file = self.metrics.save_to_json()
+
+            # Save with conversation if verbose mode enabled
+            conversation = self.messages if self.verbose else None
+            log_file = self.metrics.save_to_json(conversation=conversation)
+
             print(f"\nDetailed metrics saved to: {log_file}")
+            if self.verbose:
+                print(f"Full conversation included in output (verbose mode)")
 
     def print_running_stats(self):
         """Print running statistics after each turn"""
@@ -458,6 +474,8 @@ def main():
                         help='Model name (default: gpt-oss-120b)')
     parser.add_argument('--base-url', type=str, default="http://localhost:1234/v1",
                         help='Base URL for API (default: http://localhost:1234/v1)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Save full conversation (prompts + responses) in output')
 
     args = parser.parse_args()
 
@@ -465,7 +483,7 @@ def main():
     prompts = load_lalm_prompts()
 
     # Create benchmark
-    benchmark = LALMBenchmark(base_url=args.base_url, model=args.model)
+    benchmark = LALMBenchmark(base_url=args.base_url, model=args.model, verbose=args.verbose)
 
     # Run benchmark
     benchmark.run_benchmark(prompts, num_rounds=args.num_rounds)
