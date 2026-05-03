@@ -6,9 +6,21 @@ A comprehensive 200+ turn benchmark testing context window limits of local LLMs
 through progressively escalating technical discussions about Large Audio Language
 Models (LALMs) and music audio production.
 
+Designed to be friendly to server-side prompt / KV caching (oMLX, mlx_lm.server,
+vLLM, SGLang, Ollama, LM Studio). Each turn appends the new user message and
+the assistant's verbatim response to the conversation; past messages are never
+mutated. That keeps the request prefix byte-identical to the previous turn,
+which is the precondition for cache reuse. Without a warm cache, prefill
+dominates wall-clock at large context (literally hours for 1M-token contexts);
+with one, only the new user message has to be prefilled each turn.
+
 Tracks:
 - Time to first token (TTFT) - prompt processing time
 - Streaming tokens/second - generation speed after first token
+- Prefill tokens/second (= prompt_tokens / TTFT) and new-context tokens per
+  turn - the headline KV-cache health signal. With caching working, prefill
+  tok/s climbs sharply after turn 1 and TTFT stays roughly flat as the
+  conversation grows.
 - Turn counts (user turns, assistant turns, total)
 - Token counts (prompt, completion, total conversation)
 - Reasoning metrics (tokens, time, character length in <think> tags)
@@ -45,6 +57,16 @@ class TurnMetrics:
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
     conversation_total_tokens: Optional[int] = None
+
+    # Prefill / KV-cache metrics
+    # prefill_tokens_per_sec = prompt_tokens / TTFT. With a working server-side
+    # KV cache this rises sharply turn-over-turn, since most prefix tokens are
+    # served from cache instead of being prefilled.
+    # new_context_tokens = tokens added to the prefix since the previous turn
+    # (i.e. last turn's prompt + completion). Once the cache is warm this
+    # roughly equals the new user message length plus chat-template overhead.
+    prefill_tokens_per_sec: Optional[float] = None
+    new_context_tokens: Optional[int] = None
 
     # Reasoning metrics
     reasoning_tokens: Optional[int] = None
@@ -84,6 +106,15 @@ class BenchmarkMetrics:
         avg_streaming_speed = sum(m.streaming_tokens_per_sec for m in self.turn_metrics if m.streaming_tokens_per_sec > 0) / len([m for m in self.turn_metrics if m.streaming_tokens_per_sec > 0])
         total_time = time.time() - self.start_time
 
+        # Prefill / KV-cache trajectory
+        prefill_turns = [m for m in self.turn_metrics if m.prefill_tokens_per_sec]
+        avg_prefill_tps = (
+            sum(m.prefill_tokens_per_sec for m in prefill_turns) / len(prefill_turns)
+            if prefill_turns else 0.0
+        )
+        first_ttft_ms = self.turn_metrics[0].time_to_first_token_ms
+        last_ttft_ms = self.turn_metrics[-1].time_to_first_token_ms
+
         # Calculate reasoning statistics
         reasoning_turns = [m for m in self.turn_metrics if m.reasoning_tokens and m.reasoning_tokens > 0]
         total_reasoning_tokens = sum(m.reasoning_tokens for m in reasoning_turns)
@@ -100,6 +131,9 @@ class BenchmarkMetrics:
             "total_runtime_sec": total_time,
             "avg_time_to_first_token_ms": avg_ttft,
             "avg_streaming_tokens_per_sec": avg_streaming_speed,
+            "avg_prefill_tokens_per_sec": avg_prefill_tps,
+            "first_turn_ttft_ms": first_ttft_ms,
+            "last_turn_ttft_ms": last_ttft_ms,
             "last_turn_completed": len(self.turn_metrics),
             "reasoning_stats": {
                 "total_reasoning_tokens": total_reasoning_tokens,
@@ -167,13 +201,30 @@ def extract_reasoning_content(text: str, encoding) -> Tuple[str, int, int]:
 class LALMBenchmark:
     """Main benchmark orchestrator"""
 
-    def __init__(self, base_url: str = "http://localhost:1234/v1", model: Optional[str] = None, verbose: bool = False):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:1234/v1",
+        model: Optional[str] = None,
+        verbose: bool = False,
+        reasoning_effort: Optional[str] = None,
+        seed: Optional[int] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 32768,
+    ):
         self.client = OpenAI(base_url=base_url, api_key="lm-studio")
         self.model = model
         self.messages: List[Dict[str, str]] = []
         self.metrics = BenchmarkMetrics()
         self.conversation_total_tokens = 0
         self.verbose = verbose
+        self.reasoning_effort = reasoning_effort
+        self.seed = seed
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        # Tracks last turn's prompt+completion total so we can compute the
+        # number of *new* tokens added to the prefix on each turn. This is
+        # the signal that exposes whether the server is reusing its KV cache.
+        self._prev_total_tokens_after_assistant = 0
 
         # Initialize tiktoken encoding for accurate token counting
         # Use cl100k_base which is used by GPT-4 and GPT-3.5-turbo
@@ -203,23 +254,33 @@ class LALMBenchmark:
     def execute_turn(self, user_prompt: str, turn_number: int) -> TurnMetrics:
         """Execute a single conversation turn with streaming"""
 
-        # Add user message
+        # Cache-prefix invariant: never mutate or rewrite past messages. The
+        # server's KV cache is keyed on the exact prefix of tokens; appending
+        # only at the tail keeps every prior turn cacheable.
         self.messages.append({"role": "user", "content": user_prompt})
         user_turn_num = (len(self.messages) + 1) // 2
 
         # Start timing
         request_start = time.time()
 
-        # Make streaming request
-        stream = self.client.chat.completions.create(
-            model=self.get_model_name(),
-            messages=self.messages,
-            stream=True,
-            stream_options={"include_usage": True},
-            temperature=0.7,
-            max_tokens=32768,
-            reasoning_effort="low"
-        )
+        # Build kwargs conditionally so the request stays compatible with
+        # strict OpenAI-compatible servers (oMLX, vLLM strict, etc.) that
+        # reject unknown fields. `reasoning_effort` and `seed` are only
+        # included if the user opted in.
+        request_kwargs = {
+            "model": self.get_model_name(),
+            "messages": self.messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        if self.reasoning_effort is not None:
+            request_kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.seed is not None:
+            request_kwargs["seed"] = self.seed
+
+        stream = self.client.chat.completions.create(**request_kwargs)
 
         # Track streaming
         first_token_time = None
@@ -276,6 +337,9 @@ class LALMBenchmark:
 
         # Assemble response
         full_response = ''.join(collected_chunks)
+        # Store the assistant message *verbatim*, including any <think>...</think>
+        # block. Stripping or rewriting it would change the prefix on the next
+        # turn and invalidate the server's KV cache.
         self.messages.append({"role": "assistant", "content": full_response})
         assistant_turn_num = len(self.messages) // 2
 
@@ -323,6 +387,24 @@ class LALMBenchmark:
             print(f"WARNING (Turn {turn_number}): No token count information from API. "
                   "Conversation token accumulation may be inaccurate.")
 
+        # Prefill / KV-cache metrics. With caching enabled server-side, only
+        # `new_context_tokens` actually need to be prefilled even though the
+        # request carries the entire prefix; that is what makes
+        # `prefill_tokens_per_sec` shoot up dramatically once the cache warms.
+        prompt_tokens_this_turn = usage_info.prompt_tokens if usage_info else None
+        completion_tokens_this_turn = usage_info.completion_tokens if usage_info else None
+        prefill_tokens_per_sec: Optional[float] = None
+        new_context_tokens: Optional[int] = None
+        if prompt_tokens_this_turn and ttft_ms > 0:
+            prefill_tokens_per_sec = prompt_tokens_this_turn / (ttft_ms / 1000.0)
+            new_context_tokens = max(
+                0, prompt_tokens_this_turn - self._prev_total_tokens_after_assistant
+            )
+        if prompt_tokens_this_turn is not None and completion_tokens_this_turn is not None:
+            self._prev_total_tokens_after_assistant = (
+                prompt_tokens_this_turn + completion_tokens_this_turn
+            )
+
         # Create metrics object
         metrics = TurnMetrics(
             turn_number=turn_number,
@@ -333,10 +415,12 @@ class LALMBenchmark:
             time_to_first_token_ms=ttft_ms,
             streaming_tokens_per_sec=tokens_per_sec,
             total_turn_time_sec=total_turn_time,
-            prompt_tokens=usage_info.prompt_tokens if usage_info else None,
-            completion_tokens=usage_info.completion_tokens if usage_info else None,
+            prompt_tokens=prompt_tokens_this_turn,
+            completion_tokens=completion_tokens_this_turn,
             total_tokens=usage_info.total_tokens if usage_info else None,
             conversation_total_tokens=self.conversation_total_tokens,
+            prefill_tokens_per_sec=prefill_tokens_per_sec,
+            new_context_tokens=new_context_tokens,
             reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
             reasoning_char_length=reasoning_char_len if reasoning_char_len > 0 else None,
             reasoning_time_sec=reasoning_time,
@@ -374,7 +458,19 @@ class LALMBenchmark:
 
                 # Display metrics
                 print(f"User turn #{metrics.user_turn_number} | Assistant turn #{metrics.assistant_turn_number}")
-                print(f"TTFT: {metrics.time_to_first_token_ms:.1f}ms | Streaming: {metrics.streaming_tokens_per_sec:.1f} tok/s")
+                prefill_str = (
+                    f"{metrics.prefill_tokens_per_sec:,.0f} tok/s"
+                    if metrics.prefill_tokens_per_sec else "N/A"
+                )
+                new_ctx_str = (
+                    f"{metrics.new_context_tokens:,}"
+                    if metrics.new_context_tokens is not None else "N/A"
+                )
+                print(
+                    f"TTFT: {metrics.time_to_first_token_ms:.1f}ms | "
+                    f"Prefill: {prefill_str} | New ctx: {new_ctx_str} tok | "
+                    f"Streaming: {metrics.streaming_tokens_per_sec:.1f} tok/s"
+                )
                 print(f"Tokens - Prompt: {metrics.prompt_tokens or 'N/A'} | Completion: {metrics.completion_tokens or 'N/A'} | Total in conversation: {metrics.conversation_total_tokens or 'N/A'}")
 
                 # Display reasoning metrics if present
@@ -419,6 +515,10 @@ class LALMBenchmark:
               f"Tokens: {summary.get('total_conversation_tokens', 0):,} | "
               f"Avg TTFT: {summary.get('avg_time_to_first_token_ms', 0):.1f}ms | "
               f"Avg Speed: {summary.get('avg_streaming_tokens_per_sec', 0):.1f} tok/s")
+        print(f"Avg prefill: {summary.get('avg_prefill_tokens_per_sec', 0):,.0f} tok/s | "
+              f"TTFT trajectory: {summary.get('first_turn_ttft_ms', 0):.1f}ms → "
+              f"{summary.get('last_turn_ttft_ms', 0):.1f}ms "
+              f"(flat = KV cache hit)")
 
         # Display reasoning statistics if any
         reasoning_stats = summary.get('reasoning_stats', {})
@@ -443,6 +543,12 @@ class LALMBenchmark:
         print(f"Total runtime: {summary.get('total_runtime_sec', 0):.2f}s")
         print(f"Avg TTFT: {summary.get('avg_time_to_first_token_ms', 0):.1f}ms")
         print(f"Avg streaming speed: {summary.get('avg_streaming_tokens_per_sec', 0):.1f} tok/s")
+        print(f"Avg prefill speed: {summary.get('avg_prefill_tokens_per_sec', 0):,.0f} tok/s")
+        print(
+            f"TTFT trajectory: turn 1 = {summary.get('first_turn_ttft_ms', 0):.1f}ms, "
+            f"final = {summary.get('last_turn_ttft_ms', 0):.1f}ms "
+            f"(flat trajectory at growing context indicates working KV cache)"
+        )
 
         # Display reasoning statistics
         reasoning_stats = summary.get('reasoning_stats', {})
@@ -470,10 +576,25 @@ def main():
     parser = argparse.ArgumentParser(description='Run LALM Context Exhaustion Benchmark')
     parser.add_argument('--num-rounds', type=int, default=None,
                         help='Number of rounds to run (default: all prompts)')
-    parser.add_argument('--model', type=str, default="gpt-oss-120b",
-                        help='Model name (default: gpt-oss-120b)')
+    parser.add_argument('--model', type=str, default=None,
+                        help='Model name (default: auto-detect from server via /v1/models)')
     parser.add_argument('--base-url', type=str, default="http://localhost:1234/v1",
-                        help='Base URL for API (default: http://localhost:1234/v1)')
+                        help=('Base URL for API (default: http://localhost:1234/v1 for '
+                              'LM Studio; common oMLX defaults: http://localhost:8000/v1, '
+                              'http://localhost:8001/v1)'))
+    parser.add_argument('--reasoning-effort', choices=['none', 'low', 'medium', 'high'],
+                        default='none',
+                        help=('Reasoning effort to request (default: none = do not send '
+                              'the field). Use "low"/"medium"/"high" only with servers '
+                              'that support the reasoning_effort parameter (e.g. LM Studio '
+                              'with gpt-oss). Strict OpenAI-compatible servers like oMLX '
+                              'reject unknown fields, so leave as "none".'))
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Optional sampling seed for reproducible runs')
+    parser.add_argument('--temperature', type=float, default=0.7,
+                        help='Sampling temperature (default: 0.7)')
+    parser.add_argument('--max-tokens', type=int, default=32768,
+                        help='Max tokens per response (default: 32768)')
     parser.add_argument('--verbose', action='store_true',
                         help='Save full conversation (prompts + responses) in output')
 
@@ -482,8 +603,20 @@ def main():
     # Load prompts from JSON file
     prompts = load_lalm_prompts()
 
+    # Translate "none" sentinel into actual None so the field is omitted from
+    # the request body entirely (required for strict servers like oMLX).
+    reasoning_effort = None if args.reasoning_effort == 'none' else args.reasoning_effort
+
     # Create benchmark
-    benchmark = LALMBenchmark(base_url=args.base_url, model=args.model, verbose=args.verbose)
+    benchmark = LALMBenchmark(
+        base_url=args.base_url,
+        model=args.model,
+        verbose=args.verbose,
+        reasoning_effort=reasoning_effort,
+        seed=args.seed,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+    )
 
     # Run benchmark
     benchmark.run_benchmark(prompts, num_rounds=args.num_rounds)
